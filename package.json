@@ -1,0 +1,44 @@
+{
+  "name": "pi-claude-oauth-adapter",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "description": "Claude OAuth routing workaround for pi that strips the docs-only system section and reinjects it outside the system prompt.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "anthropic",
+    "claude",
+    "oauth"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minzique/dotfiles-agents.git",
+    "directory": "packages/pi-claude-oauth-adapter"
+  },
+  "homepage": "https://github.com/minzique/dotfiles-agents/tree/main/packages/pi-claude-oauth-adapter",
+  "bugs": {
+    "url": "https://github.com/minzique/dotfiles-agents/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  }
+}
