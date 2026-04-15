@@ -134,12 +134,17 @@ function getLogFile(): string | null {
 function log(event: string, details: Record<string, unknown>): void {
   const logFile = getLogFile();
   if (!logFile) return;
-  mkdirSync(dirname(logFile), { recursive: true });
-  appendFileSync(
-    logFile,
-    `${JSON.stringify({ timestamp: new Date().toISOString(), event, ...details })}\n`,
-    "utf8",
-  );
+
+  try {
+    mkdirSync(dirname(logFile), { recursive: true });
+    appendFileSync(
+      logFile,
+      `${JSON.stringify({ timestamp: new Date().toISOString(), event, ...details })}\n`,
+      "utf8",
+    );
+  } catch {
+    // Never let optional debug logging break the session.
+  }
 }
 
 function shouldApply(ctx: ExtensionContext): boolean {
