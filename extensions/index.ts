@@ -8,6 +8,8 @@ const DOCS_MARKER =
   "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):";
 const IDENTITY_BLOCK = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CUSTOM_TYPE = "claude-oauth-docs-context";
+const READY_STATUS_KEY = "claude-oauth-ready";
+const ISSUE_STATUS_KEY = "claude-oauth-issue";
 const END_MARKERS = ["\n\n# Project Context", "\n\n<available_skills>", "\nCurrent date:"] as const;
 const PI_TOPIC_REGEX =
   /\b(pi|@mariozechner\/pi-|pi-mono|coding agent harness|pi sdk|pi extension|pi theme|pi skill|pi tui|pi package|prompt templates?|keybindings?|custom providers?|adding models?)\b/i;
@@ -17,6 +19,9 @@ const DEFAULT_ENTRYPOINT = "pi";
 
 type ReinjectionMode = "none" | "prepend-custom-message" | "append-custom-message" | "user-reminder";
 type ReinjectionScope = "never" | "always" | "pi-only";
+type DocsSource = "system" | "fallback" | "missing";
+type BillingHeaderState = "unknown" | "present" | "injected";
+type AdapterPhase = "inactive" | "ready" | "active" | "issue";
 
 interface ActiveTurnState {
   docsSection: string;
@@ -24,6 +29,15 @@ interface ActiveTurnState {
   mode: ReinjectionMode;
   prompt: string;
   timestamp: number;
+}
+
+interface AdapterStatusState {
+  phase: AdapterPhase;
+  applies: boolean;
+  suppressWarning: boolean;
+  docsSource: DocsSource;
+  billingHeader: BillingHeaderState;
+  reason: string;
 }
 
 interface TextContentPart {
@@ -60,7 +74,21 @@ interface PayloadLike {
   tools?: unknown;
 }
 
+interface ResolvedDocsSection {
+  extracted: { docsSection: string; strippedPrompt: string } | null;
+  docsSection: string | null;
+  docsSource: DocsSource;
+}
+
 let activeTurn: ActiveTurnState | null = null;
+let adapterStatus: AdapterStatusState = {
+  phase: "inactive",
+  applies: false,
+  suppressWarning: false,
+  docsSource: "missing",
+  billingHeader: "unknown",
+  reason: "Not using Anthropic OAuth",
+};
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -152,6 +180,37 @@ function shouldApply(ctx: ExtensionContext): boolean {
   return !!model && model.provider === "anthropic" && ctx.modelRegistry.isUsingOAuth(model);
 }
 
+function clearAdapterStatuses(ctx: ExtensionContext): void {
+  ctx.ui.setStatus(READY_STATUS_KEY, undefined);
+  ctx.ui.setStatus(ISSUE_STATUS_KEY, undefined);
+}
+
+function renderAdapterStatus(ctx: ExtensionContext): void {
+  clearAdapterStatuses(ctx);
+
+  if (!adapterStatus.applies) return;
+
+  const theme = ctx.ui.theme;
+  if (adapterStatus.phase === "ready") {
+    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", "✓ Claude OAuth ready"));
+    return;
+  }
+
+  if (adapterStatus.phase === "active") {
+    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", "✓ Claude OAuth active"));
+    return;
+  }
+
+  if (adapterStatus.phase === "issue") {
+    ctx.ui.setStatus(ISSUE_STATUS_KEY, theme.fg("warning", "⚠ Claude OAuth setup"));
+  }
+}
+
+function setAdapterStatus(ctx: ExtensionContext, nextStatus: AdapterStatusState): void {
+  adapterStatus = nextStatus;
+  renderAdapterStatus(ctx);
+}
+
 function shouldInjectDocs(prompt: string): boolean {
   const scope = getEnvScope();
   if (scope === "never") return false;
@@ -217,6 +276,63 @@ function readFallbackDocsSection(): string | null {
   }
 
   return buildDynamicFallbackDocsSection();
+}
+
+function resolveDocsSection(systemPrompt: string): ResolvedDocsSection {
+  const extracted = extractDocsSection(systemPrompt);
+  if (extracted) {
+    return { extracted, docsSection: extracted.docsSection, docsSource: "system" };
+  }
+
+  const fallbackDocs = readFallbackDocsSection();
+  if (fallbackDocs) {
+    return { extracted: null, docsSection: fallbackDocs, docsSource: "fallback" };
+  }
+
+  return { extracted: null, docsSection: null, docsSource: "missing" };
+}
+
+function syncSetupStatus(ctx: ExtensionContext, systemPrompt: string): ResolvedDocsSection {
+  if (!shouldApply(ctx)) {
+    setAdapterStatus(ctx, {
+      phase: "inactive",
+      applies: false,
+      suppressWarning: false,
+      docsSource: "missing",
+      billingHeader: "unknown",
+      reason: "Not using Anthropic OAuth",
+    });
+    return { extracted: null, docsSection: null, docsSource: "missing" };
+  }
+
+  const resolved = resolveDocsSection(systemPrompt);
+  if (!resolved.docsSection) {
+    setAdapterStatus(ctx, {
+      phase: "issue",
+      applies: true,
+      suppressWarning: false,
+      docsSource: resolved.docsSource,
+      billingHeader: "unknown",
+      reason: "No Pi docs context available to rehydrate Anthropic OAuth requests",
+    });
+    return resolved;
+  }
+
+  const nextPhase: AdapterPhase = adapterStatus.phase === "active" ? "active" : "ready";
+  const nextReason = resolved.docsSource === "system"
+    ? "Using system prompt docs context"
+    : "Using fallback docs context";
+
+  setAdapterStatus(ctx, {
+    phase: nextPhase,
+    applies: true,
+    suppressWarning: true,
+    docsSource: resolved.docsSource,
+    billingHeader: adapterStatus.billingHeader,
+    reason: nextReason,
+  });
+
+  return resolved;
 }
 
 function wrapDocsContext(docsSection: string): string {
@@ -322,8 +438,6 @@ function injectDocs(messages: AgentMessage[], state: ActiveTurnState): AgentMess
       return appendCustomMessage(messages, state.docsSection, state.timestamp);
     case "user-reminder":
       return prependReminderToLatestUser(messages, state.docsSection);
-    case "none":
-      return messages;
   }
 }
 
@@ -383,21 +497,28 @@ function normalizeSystemBlocks(blocks: TextBlock[], ctx: ExtensionContext, messa
 }
 
 export default function claudeOauthAdapter(pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    syncSetupStatus(ctx, ctx.getSystemPrompt());
+  });
+
+  pi.on("model_select", (_event, ctx) => {
+    syncSetupStatus(ctx, ctx.getSystemPrompt());
+  });
+
   pi.on("before_agent_start", (event, ctx) => {
+    const resolved = syncSetupStatus(ctx, event.systemPrompt);
     if (!shouldApply(ctx)) {
       activeTurn = null;
       return;
     }
 
-    const extracted = extractDocsSection(event.systemPrompt);
-    const docsSection = extracted?.docsSection ?? readFallbackDocsSection();
-    if (!docsSection) {
+    if (!resolved.docsSection) {
       activeTurn = null;
       return;
     }
 
     activeTurn = {
-      docsSection,
+      docsSection: resolved.docsSection,
       shouldInject: shouldInjectDocs(event.prompt),
       mode: getEnvMode(),
       prompt: event.prompt,
@@ -409,12 +530,14 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
       shouldInject: activeTurn.shouldInject,
       mode: activeTurn.mode,
       scope: getEnvScope(),
-      docsLength: docsSection.length,
-      strippedFromSystem: !!extracted,
+      docsLength: resolved.docsSection.length,
+      docsSource: resolved.docsSource,
+      strippedFromSystem: !!resolved.extracted,
+      suppressWarning: adapterStatus.suppressWarning,
     });
 
-    if (extracted) {
-      return { systemPrompt: extracted.strippedPrompt };
+    if (resolved.extracted) {
+      return { systemPrompt: resolved.extracted.strippedPrompt };
     }
 
     return;
@@ -436,6 +559,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
     if (!shouldApply(ctx) || !isPayloadLike(event.payload)) return;
 
     const currentBlocks = Array.isArray(event.payload.system) ? event.payload.system.filter(isTextBlock) : [];
+    const hadBillingHeader = currentBlocks.some((block) => block.text.startsWith("x-anthropic-billing-header:"));
     const normalized = normalizeSystemBlocks(currentBlocks, ctx, event.payload.messages);
     const changed =
       normalized.billingAdded ||
@@ -446,9 +570,24 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
       ? { ...event.payload, system: normalized.blocks }
       : event.payload;
 
+    setAdapterStatus(ctx, {
+      phase: "active",
+      applies: true,
+      suppressWarning: true,
+      docsSource: adapterStatus.docsSource === "missing" ? "fallback" : adapterStatus.docsSource,
+      billingHeader: normalized.billingAdded ? "injected" : hadBillingHeader ? "present" : "unknown",
+      reason: normalized.billingAdded
+        ? "Injected Claude billing header into Anthropic OAuth request"
+        : hadBillingHeader
+          ? "Anthropic OAuth request already includes Claude billing header"
+          : "Normalized Anthropic OAuth request",
+    });
+
     log("before_provider_request", {
       changed,
       billingAdded: normalized.billingAdded,
+      docsSource: adapterStatus.docsSource,
+      suppressWarning: adapterStatus.suppressWarning,
       systemBefore: currentBlocks.map((block, index) => `${index}: ${block.text.slice(0, 140)}`),
       systemAfter: normalized.blocks.map((block, index) => `${index}: ${block.text.slice(0, 140)}`),
       messageCount: Array.isArray(nextPayload.messages) ? nextPayload.messages.length : undefined,
@@ -458,7 +597,45 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
     return nextPayload;
   });
 
+  pi.on("after_provider_response", (event, ctx) => {
+    if (!shouldApply(ctx)) return;
+    if (event.status >= 400) {
+      setAdapterStatus(ctx, {
+        phase: "issue",
+        applies: true,
+        suppressWarning: false,
+        docsSource: adapterStatus.docsSource,
+        billingHeader: adapterStatus.billingHeader,
+        reason: `Anthropic OAuth request failed with HTTP ${event.status}`,
+      });
+      return;
+    }
+
+    if (adapterStatus.phase === "active") {
+      setAdapterStatus(ctx, {
+        ...adapterStatus,
+        phase: "active",
+        applies: true,
+        suppressWarning: true,
+        reason: `Anthropic OAuth request succeeded (${event.status})`,
+      });
+    }
+  });
+
   pi.on("agent_end", () => {
     activeTurn = null;
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    activeTurn = null;
+    adapterStatus = {
+      phase: "inactive",
+      applies: false,
+      suppressWarning: false,
+      docsSource: "missing",
+      billingHeader: "unknown",
+      reason: "Session ended",
+    };
+    clearAdapterStatuses(ctx);
   });
 }
