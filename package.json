@@ -1,18 +1,20 @@
 {
   "name": "pi-claude-oauth-adapter",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": false,
   "type": "module",
   "files": [
     "extensions",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
-  "description": "Claude OAuth routing workaround for pi that strips the docs-only system section and reinjects it outside the system prompt.",
+  "description": "Anthropic OAuth / Claude Code compatibility adapter for Pi.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "anthropic",
     "claude",
+    "claude-code",
     "oauth"
   ],
   "repository": {

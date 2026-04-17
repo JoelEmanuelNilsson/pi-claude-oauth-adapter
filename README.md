@@ -1,17 +1,46 @@
 # pi-claude-oauth-adapter
 
-Claude OAuth routing workaround for Pi.
+Anthropic OAuth / Claude Code compatibility adapter for Pi.
 
-It does three things for Anthropic OAuth/subscription sessions:
-- strips the `Pi documentation (...)` docs-only section out of the system prompt
-- removes the `You are Claude Code, Anthropic's official CLI for Claude.` identity block
-- reinjects the stripped docs context outside the system prompt when needed so Pi-specific help still works
+**Install:** `pi install npm:pi-claude-oauth-adapter`
 
-It also adds the Claude billing header in `before_provider_request` if the installed Pi provider version does not already include it.
+This package patches Anthropic OAuth / Claude Pro/Max sessions in Pi. It strips the docs-only Pi section out of the system prompt, removes the Claude Code identity block, reinjects Pi docs context outside the system prompt when needed, and makes sure the Claude billing header is present for OAuth requests.
+
+## What's new in 0.1.2
+
+- Pi can now show `✓ Claude OAuth ready`, `✓ Claude OAuth active`, or `⚠ Claude OAuth setup` in the footer while the adapter is running.
+- The adapter now exposes `claude-oauth-ready` and `claude-oauth-issue` status keys so Pi runtimes can suppress the generic Anthropic subscription warning only when the adapter is actually healthy.
+
+The second point depends on the Pi runtime version. The package publishes the readiness signal; Pi still has to consume it.
+
+## When this package does anything
+
+It only activates when both of these are true:
+
+- the selected provider is `anthropic`
+- Pi is using Anthropic OAuth / subscription auth
+
+If you use `ANTHROPIC_API_KEY` only, this package stays inactive.
 
 ## Install
 
-This repo owns the package. Add it to Pi settings with the local dotfiles path:
+### From npm
+
+```bash
+pi install npm:pi-claude-oauth-adapter
+pi list
+```
+
+Then inside Pi:
+
+1. run `/login`
+2. choose **Claude Pro/Max**
+3. pick an Anthropic model in `/model`
+4. start using Pi normally
+
+### From a local checkout
+
+If you use this repo directly, add the local package path to Pi settings:
 
 ```json
 {
@@ -21,7 +50,17 @@ This repo owns the package. Add it to Pi settings with the local dotfiles path:
 }
 ```
 
-`./setup.sh` now provisions that automatically by linking `home/.pi/agent/settings.json` and verifying the local package path during Pi setup.
+`./setup.sh` in this repo already provisions that path when the active Pi settings symlink points at this checkout.
+
+## Verify it is active
+
+In an Anthropic OAuth session, the package should either:
+
+- show `✓ Claude OAuth ready` before the first request
+- show `✓ Claude OAuth active` after a normalized Anthropic OAuth request
+- show `⚠ Claude OAuth setup` if the adapter is enabled but missing the docs context it needs
+
+If you are using API-key auth instead of OAuth, none of those statuses should appear.
 
 ## Config
 
@@ -39,9 +78,7 @@ Environment variables:
 - `PI_CLAUDE_CODE_ENTRYPOINT=...`
   - optional billing-header overrides
 
-## Recommended defaults
-
-For normal usage, no env vars are required.
+For most users, no env vars are required.
 
 If you want the stripped docs context available for every request instead of only Pi-related prompts:
 
@@ -49,7 +86,26 @@ If you want the stripped docs context available for every request instead of onl
 PI_CLAUDE_OAUTH_REINJECT_SCOPE=always pi
 ```
 
+## Release notes
+
+See [CHANGELOG.md](./CHANGELOG.md).
+
+## Maintainer release flow
+
+```bash
+cd packages/pi-claude-oauth-adapter
+npm pack --dry-run
+npm publish --access public
+```
+
+Or from repo root:
+
+```bash
+npm publish ./packages/pi-claude-oauth-adapter --access public
+```
+
 ## Notes
 
-- This extension only activates for `anthropic` models when Pi is using OAuth credentials.
+- This package does **not** implement Anthropic auth itself. Pi already has built-in Anthropic OAuth support.
+- This package is the compatibility layer on top of Pi's Anthropic OAuth flow.
 - It is designed to work both with already-patched Pi builds and older/provider builds that still need the billing header injected at request time.
