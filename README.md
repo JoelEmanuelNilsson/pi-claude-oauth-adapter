@@ -6,12 +6,14 @@ Anthropic OAuth / Claude Code compatibility adapter for Pi.
 
 This package patches Anthropic OAuth / Claude Pro/Max sessions in Pi. It strips the docs-only Pi section out of the system prompt, removes the Claude Code identity block, reinjects Pi docs context outside the system prompt when needed, and makes sure the Claude billing header is present for OAuth requests.
 
-## What's new in 0.1.2
+## What's new in 0.1.3
 
-- Pi can now show `✓ Claude OAuth ready`, `✓ Claude OAuth active`, or `⚠ Claude OAuth setup` in the footer while the adapter is running.
-- The adapter now exposes `claude-oauth-ready` and `claude-oauth-issue` status keys so Pi runtimes can suppress the generic Anthropic subscription warning only when the adapter is actually healthy.
+- Pi now surfaces Claude unified usage-limit state on the real 429 path, including a follow-up quota check that rewrites generic Anthropic rate-limit failures into Claude-style messages like `You've hit your limit · resets 10:30pm (Asia/Colombo)`.
+- The injected Claude billing header now matches Claude Code `2.1.118` semantics more closely: updated `cc_version`, fixed `cch=00000`, and optional `cc_workload` passthrough.
+- The adapter still exposes `claude-oauth-ready` and `claude-oauth-issue` status keys so Pi runtimes can suppress generic Anthropic subscription warnings only when the adapter is actually healthy.
+- On 429s, the adapter patches Anthropic's generic `rate_limit_error` into the resolved Claude usage-limit message so Pi's auto-retry logic stops thrashing.
 
-The second point depends on the Pi runtime version. The package publishes the readiness signal; Pi still has to consume it.
+The last point depends on the Pi runtime version. The package publishes the readiness signal; Pi still has to consume it.
 
 ## When this package does anything
 
@@ -58,6 +60,7 @@ In an Anthropic OAuth session, the package should either:
 
 - show `✓ Claude OAuth ready` before the first request
 - show `✓ Claude OAuth active` after a normalized Anthropic OAuth request
+- show a real Claude usage status like `You've hit your limit · resets 10:30pm (Asia/Colombo)` when Anthropic rejects the request and the adapter resolves quota state via the follow-up check
 - show `⚠ Claude OAuth setup` if the adapter is enabled but missing the docs context it needs
 
 If you are using API-key auth instead of OAuth, none of those statuses should appear.
@@ -76,7 +79,9 @@ Environment variables:
   - optional docs fallback override
 - `PI_CLAUDE_CODE_VERSION=...`
 - `PI_CLAUDE_CODE_ENTRYPOINT=...`
-  - optional billing-header overrides
+- `PI_CLAUDE_CODE_WORKLOAD=...`
+- `PI_CLAUDE_CODE_SUBSCRIPTION_TYPE=...`
+  - optional billing-header / footer-label overrides
 
 For most users, no env vars are required.
 
@@ -109,3 +114,4 @@ npm publish ./packages/pi-claude-oauth-adapter --access public
 - This package does **not** implement Anthropic auth itself. Pi already has built-in Anthropic OAuth support.
 - This package is the compatibility layer on top of Pi's Anthropic OAuth flow.
 - It is designed to work both with already-patched Pi builds and older/provider builds that still need the billing header injected at request time.
+- Full `user-agent` / provider-header parity with Claude Code does **not** belong in this package. Pi's provider override API is provider-wide, not OAuth-scoped, so that part should land in `@mariozechner/pi-ai` instead of changing all Anthropic traffic from here.
