@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { createAssistantMessageEventStream, streamSimpleAnthropic, type AssistantMessageEvent, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 const DOCS_MARKER =
@@ -13,15 +14,44 @@ const ISSUE_STATUS_KEY = "claude-oauth-issue";
 const END_MARKERS = ["\n\n# Project Context", "\n\n<available_skills>", "\nCurrent date:"] as const;
 const PI_TOPIC_REGEX =
   /\b(pi|@mariozechner\/pi-|pi-mono|coding agent harness|pi sdk|pi extension|pi theme|pi skill|pi tui|pi package|prompt templates?|keybindings?|custom providers?|adding models?)\b/i;
-const DEFAULT_CLAUDE_CODE_VERSION = "2.1.96";
+const DEFAULT_CLAUDE_CODE_VERSION = "2.1.118";
 const BILLING_SALT = "59cf53e54c78";
 const DEFAULT_ENTRYPOINT = "pi";
+const DEFAULT_BILLING_CCH = "00000";
+const QUOTA_CHECK_MODEL = "claude-haiku-4-5";
+const QUOTA_CHECK_CACHE_TTL_MS = 30_000;
+const SURPASSED_THRESHOLD_CLAIMS = [
+  { claimAbbrev: "5h", rateLimitType: "five_hour" },
+  { claimAbbrev: "7d", rateLimitType: "seven_day" },
+  { claimAbbrev: "overage", rateLimitType: "overage" },
+] as const;
+const RATE_LIMIT_WARNING_CONFIG = [
+  {
+    rateLimitType: "five_hour",
+    claimAbbrev: "5h",
+    windowSeconds: 18_000,
+    thresholds: [{ utilization: 0.9, timePct: 0.72 }],
+  },
+  {
+    rateLimitType: "seven_day",
+    claimAbbrev: "7d",
+    windowSeconds: 604_800,
+    thresholds: [
+      { utilization: 0.75, timePct: 0.6 },
+      { utilization: 0.5, timePct: 0.35 },
+      { utilization: 0.25, timePct: 0.15 },
+    ],
+  },
+] as const;
 
 type ReinjectionMode = "none" | "prepend-custom-message" | "append-custom-message" | "user-reminder";
 type ReinjectionScope = "never" | "always" | "pi-only";
 type DocsSource = "system" | "fallback" | "missing";
-type BillingHeaderState = "unknown" | "present" | "injected";
-type AdapterPhase = "inactive" | "ready" | "active" | "issue";
+type BillingHeaderState = "unknown" | "present" | "updated" | "injected";
+type AdapterPhase = "inactive" | "ready" | "active" | "warning" | "issue";
+type ClaudeRateLimitType = "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage";
+type ClaudeRateLimitStatus = "allowed" | "allowed_warning" | "rejected";
+type ClaudeOverageStatus = "allowed" | "allowed_warning" | "rejected";
 
 interface ActiveTurnState {
   docsSection: string;
@@ -38,6 +68,23 @@ interface AdapterStatusState {
   docsSource: DocsSource;
   billingHeader: BillingHeaderState;
   reason: string;
+  statusText: string;
+}
+
+interface ClaudeRateLimitState {
+  status: ClaudeRateLimitStatus;
+  rateLimitType?: ClaudeRateLimitType;
+  resetsAt?: number;
+  utilization?: number;
+  overageStatus?: ClaudeOverageStatus;
+  overageResetsAt?: number;
+  overageDisabledReason?: string;
+  isUsingOverage: boolean;
+}
+
+interface ClaudeFooterStatus {
+  message: string;
+  severity: "warning" | "error";
 }
 
 interface TextContentPart {
@@ -81,6 +128,8 @@ interface ResolvedDocsSection {
 }
 
 let activeTurn: ActiveTurnState | null = null;
+let latestCtx: ExtensionContext | null = null;
+let cachedQuotaFooterStatus: { keyHash: string; value: ClaudeFooterStatus | null; checkedAt: number } | null = null;
 let adapterStatus: AdapterStatusState = {
   phase: "inactive",
   applies: false,
@@ -88,6 +137,7 @@ let adapterStatus: AdapterStatusState = {
   docsSource: "missing",
   billingHeader: "unknown",
   reason: "Not using Anthropic OAuth",
+  statusText: "",
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -130,6 +180,16 @@ function getEntrypoint(): string {
   return process.env.PI_CLAUDE_CODE_ENTRYPOINT ?? process.env.CLAUDE_CODE_ENTRYPOINT ?? DEFAULT_ENTRYPOINT;
 }
 
+function getClaudeCodeWorkload(): string | undefined {
+  const workload = process.env.PI_CLAUDE_CODE_WORKLOAD ?? process.env.CLAUDE_CODE_WORKLOAD;
+  return workload?.trim() ? workload.trim() : undefined;
+}
+
+function getClaudeSubscriptionType(): string | undefined {
+  const subscriptionType = process.env.PI_CLAUDE_CODE_SUBSCRIPTION_TYPE ?? process.env.CLAUDE_CODE_SUBSCRIPTION_TYPE;
+  return subscriptionType?.trim() ? subscriptionType.trim() : undefined;
+}
+
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -150,8 +210,345 @@ function buildBillingHeader(messages: unknown, entrypoint: string = getEntrypoin
   const version = getClaudeCodeVersion();
   const sampledChars = [4, 7, 20].map((index) => messageText[index] ?? "0").join("");
   const versionHash = sha256Hex(`${BILLING_SALT}${sampledChars}${version}`).slice(0, 3);
-  const cch = sha256Hex(messageText).slice(0, 5);
-  return `x-anthropic-billing-header: cc_version=${version}.${versionHash}; cc_entrypoint=${entrypoint}; cch=${cch};`;
+  const workload = getClaudeCodeWorkload();
+  const workloadSuffix = workload ? ` cc_workload=${workload};` : "";
+  return `x-anthropic-billing-header: cc_version=${version}.${versionHash}; cc_entrypoint=${entrypoint}; cch=${DEFAULT_BILLING_CCH};${workloadSuffix}`;
+}
+
+function getHeader(headers: Record<string, string>, name: string): string | undefined {
+  if (typeof headers[name] === "string") return headers[name];
+  const lowerName = name.toLowerCase();
+  if (typeof headers[lowerName] === "string") return headers[lowerName];
+  const matchedEntry = Object.entries(headers).find(([key]) => key.toLowerCase() === lowerName);
+  return matchedEntry?.[1];
+}
+
+function parseNumberHeader(headers: Record<string, string>, name: string): number | undefined {
+  const value = getHeader(headers, name);
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function hasUnifiedRateLimitHeaders(headers: Record<string, string>): boolean {
+  return Object.keys(headers).some((key) => key.toLowerCase().startsWith("anthropic-ratelimit-unified-"));
+}
+
+function isClaudeRateLimitType(value: string | undefined): value is ClaudeRateLimitType {
+  return value === "five_hour" || value === "seven_day" || value === "seven_day_opus" || value === "seven_day_sonnet" || value === "overage";
+}
+
+function isClaudeRateLimitStatus(value: string | undefined): value is ClaudeRateLimitStatus {
+  return value === "allowed" || value === "allowed_warning" || value === "rejected";
+}
+
+function isClaudeOverageStatus(value: string | undefined): value is ClaudeOverageStatus {
+  return value === "allowed" || value === "allowed_warning" || value === "rejected";
+}
+
+function getResetProgress(resetAt: number, windowSeconds: number): number {
+  const now = Date.now() / 1000;
+  const startedAt = resetAt - windowSeconds;
+  return Math.max(0, Math.min(1, (now - startedAt) / windowSeconds));
+}
+
+function getWarningRateLimitState(headers: Record<string, string>): ClaudeRateLimitState | null {
+  for (const { claimAbbrev, rateLimitType } of SURPASSED_THRESHOLD_CLAIMS) {
+    const surpassedThreshold = getHeader(headers, `anthropic-ratelimit-unified-${claimAbbrev}-surpassed-threshold`);
+    if (surpassedThreshold === undefined) continue;
+
+    return {
+      status: "allowed_warning",
+      rateLimitType,
+      resetsAt: parseNumberHeader(headers, `anthropic-ratelimit-unified-${claimAbbrev}-reset`),
+      utilization: parseNumberHeader(headers, `anthropic-ratelimit-unified-${claimAbbrev}-utilization`),
+      isUsingOverage: false,
+    };
+  }
+
+  for (const config of RATE_LIMIT_WARNING_CONFIG) {
+    const utilization = parseNumberHeader(headers, `anthropic-ratelimit-unified-${config.claimAbbrev}-utilization`);
+    const resetsAt = parseNumberHeader(headers, `anthropic-ratelimit-unified-${config.claimAbbrev}-reset`);
+    if (utilization === undefined || resetsAt === undefined) continue;
+
+    const progress = getResetProgress(resetsAt, config.windowSeconds);
+    const shouldWarn = config.thresholds.some((threshold) => utilization >= threshold.utilization && progress <= threshold.timePct);
+    if (!shouldWarn) continue;
+
+    return {
+      status: "allowed_warning",
+      rateLimitType: config.rateLimitType,
+      resetsAt,
+      utilization,
+      isUsingOverage: false,
+    };
+  }
+
+  return null;
+}
+
+function parseClaudeRateLimitState(headers: Record<string, string>): ClaudeRateLimitState | null {
+  if (!hasUnifiedRateLimitHeaders(headers)) return null;
+
+  const statusHeader = getHeader(headers, "anthropic-ratelimit-unified-status");
+  const status: ClaudeRateLimitStatus = isClaudeRateLimitStatus(statusHeader) ? statusHeader : "allowed";
+  const rateLimitTypeHeader = getHeader(headers, "anthropic-ratelimit-unified-representative-claim");
+  const rateLimitType = isClaudeRateLimitType(rateLimitTypeHeader) ? rateLimitTypeHeader : undefined;
+  const overageStatusHeader = getHeader(headers, "anthropic-ratelimit-unified-overage-status");
+  const overageStatus = isClaudeOverageStatus(overageStatusHeader) ? overageStatusHeader : undefined;
+  const overageResetsAt = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-reset");
+  const overageDisabledReason = getHeader(headers, "anthropic-ratelimit-unified-overage-disabled-reason");
+
+  if (status === "allowed" || status === "allowed_warning") {
+    const warningState = getWarningRateLimitState(headers);
+    if (warningState) return warningState;
+  }
+
+  return {
+    status,
+    rateLimitType,
+    resetsAt: parseNumberHeader(headers, "anthropic-ratelimit-unified-reset"),
+    overageStatus,
+    overageResetsAt,
+    overageDisabledReason,
+    isUsingOverage: status === "rejected" && (overageStatus === "allowed" || overageStatus === "allowed_warning"),
+  };
+}
+
+function getSystemTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+function formatResetTime(resetAt: number, includeTimeZone: boolean = false, includeTime: boolean = true): string {
+  const resetDate = new Date(resetAt * 1000);
+  const now = new Date();
+  const minutes = resetDate.getMinutes();
+  const timeZoneSuffix = includeTimeZone ? ` (${getSystemTimeZone()})` : "";
+
+  if ((resetDate.getTime() - now.getTime()) / 3_600_000 > 24) {
+    const options: Intl.DateTimeFormatOptions = {
+      month: "short",
+      day: "numeric",
+      hour: includeTime ? "numeric" : undefined,
+      minute: !includeTime || minutes === 0 ? undefined : "2-digit",
+      hour12: includeTime ? true : undefined,
+    };
+    if (resetDate.getFullYear() !== now.getFullYear()) options.year = "numeric";
+    return `${resetDate.toLocaleString("en-US", options).replace(/ ([AP]M)/i, (_match, meridiem: string) => meridiem.toLowerCase())}${timeZoneSuffix}`;
+  }
+
+  return `${resetDate.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: minutes === 0 ? undefined : "2-digit",
+    hour12: true,
+  }).replace(/ ([AP]M)/i, (_match, meridiem: string) => meridiem.toLowerCase())}${timeZoneSuffix}`;
+}
+
+function getRateLimitLabel(rateLimitType: ClaudeRateLimitType | undefined): string | null {
+  switch (rateLimitType) {
+    case "five_hour":
+      return "session limit";
+    case "seven_day":
+      return "weekly limit";
+    case "seven_day_opus":
+      return "Opus limit";
+    case "seven_day_sonnet": {
+      const subscriptionType = getClaudeSubscriptionType();
+      return subscriptionType === "pro" || subscriptionType === "enterprise" ? "weekly limit" : "Sonnet limit";
+    }
+    case "overage":
+      return "extra usage";
+    default:
+      return null;
+  }
+}
+
+function formatRejectedRateLimitMessage(state: ClaudeRateLimitState): string {
+  const resetText = state.resetsAt ? formatResetTime(state.resetsAt, true) : undefined;
+  const overageResetText = state.overageResetsAt ? formatResetTime(state.overageResetsAt, true) : undefined;
+  const suffix = resetText ? ` · resets ${resetText}` : "";
+
+  if (state.overageStatus === "rejected") {
+    let overageSuffix = "";
+    if (resetText && overageResetText && state.resetsAt && state.overageResetsAt) {
+      overageSuffix = state.resetsAt < state.overageResetsAt ? ` · resets ${resetText}` : ` · resets ${overageResetText}`;
+    } else if (resetText) {
+      overageSuffix = ` · resets ${resetText}`;
+    } else if (overageResetText) {
+      overageSuffix = ` · resets ${overageResetText}`;
+    }
+
+    if (state.overageDisabledReason === "out_of_credits") {
+      return `You're out of extra usage${overageSuffix}`;
+    }
+
+    return `You've hit your limit${overageSuffix}`;
+  }
+
+  const label = getRateLimitLabel(state.rateLimitType);
+  return `You've hit your ${label ?? "usage limit"}${suffix}`;
+}
+
+function formatWarningRateLimitMessage(state: ClaudeRateLimitState): string | null {
+  const label = getRateLimitLabel(state.rateLimitType);
+  if (!label) return null;
+
+  const utilizationPct = typeof state.utilization === "number" ? Math.floor(state.utilization * 100) : undefined;
+  const resetText = state.resetsAt ? formatResetTime(state.resetsAt, true) : undefined;
+  const normalizedLabel = state.rateLimitType === "overage" ? `${label} limit` : label;
+
+  if (utilizationPct !== undefined && resetText) {
+    return `You've used ${utilizationPct}% of your ${label} · resets ${resetText}`;
+  }
+
+  if (utilizationPct !== undefined) {
+    return `You've used ${utilizationPct}% of your ${label}`;
+  }
+
+  if (resetText) {
+    return `Approaching ${normalizedLabel} · resets ${resetText}`;
+  }
+
+  return `Approaching ${normalizedLabel}`;
+}
+
+function getClaudeFooterStatus(headers: Record<string, string>): ClaudeFooterStatus | null {
+  const state = parseClaudeRateLimitState(headers);
+  if (!state) return null;
+
+  if (state.isUsingOverage) {
+    if (state.overageStatus === "allowed_warning") {
+      return { message: "You're close to your extra usage spending limit", severity: "warning" };
+    }
+    return null;
+  }
+
+  if (state.status === "rejected") {
+    return { message: formatRejectedRateLimitMessage(state), severity: "error" };
+  }
+
+  if (state.status === "allowed_warning") {
+    if (typeof state.utilization === "number" && state.utilization < 0.7) return null;
+    const message = formatWarningRateLimitMessage(state);
+    return message ? { message, severity: "warning" } : null;
+  }
+
+  return null;
+}
+
+function getUnifiedRateLimitHeaders(headers: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).filter(([key]) => key.toLowerCase().startsWith("anthropic-ratelimit-unified-")),
+  );
+}
+
+function isAnthropicOAuthToken(apiKey: string | undefined): boolean {
+  return typeof apiKey === "string" && apiKey.includes("sk-ant-oat");
+}
+
+function isAnthropicRateLimitError(message: string | undefined): boolean {
+  if (!message) return false;
+  return /(^|\b)429(\b|$)|rate_limit_error|too many requests|rate limit/i.test(message);
+}
+
+function getQuotaCheckUrl(baseUrl: string | undefined): string {
+  const normalizedBaseUrl = (baseUrl ?? "https://api.anthropic.com").replace(/\/+$/, "");
+  if (normalizedBaseUrl.endsWith("/v1/messages")) return normalizedBaseUrl;
+  if (normalizedBaseUrl.endsWith("/v1")) return `${normalizedBaseUrl}/messages`;
+  return `${normalizedBaseUrl}/v1/messages`;
+}
+
+async function fetchQuotaCheckHeaders(
+  apiKey: string,
+  baseUrl: string | undefined,
+  headers: Record<string, string> | undefined,
+): Promise<Record<string, string> | null> {
+  const response = await fetch(getQuotaCheckUrl(baseUrl), {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+      "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+      "user-agent": `claude-cli/${getClaudeCodeVersion()}`,
+      "x-app": "cli",
+      "x-anthropic-billing-header": buildBillingHeader([{ role: "user", content: "quota" }]),
+      ...headers,
+    },
+    body: JSON.stringify({
+      model: QUOTA_CHECK_MODEL,
+      max_tokens: 1,
+      messages: [{ role: "user", content: "quota" }],
+    }),
+  });
+
+  return Object.fromEntries(response.headers.entries());
+}
+
+async function resolveAnthropicQuotaFooterStatus(
+  model: Model<"anthropic-messages">,
+  options: SimpleStreamOptions | undefined,
+): Promise<ClaudeFooterStatus | null> {
+  if (!isAnthropicOAuthToken(options?.apiKey)) return null;
+
+  const keyHash = sha256Hex(options.apiKey);
+  if (cachedQuotaFooterStatus && cachedQuotaFooterStatus.keyHash === keyHash && Date.now() - cachedQuotaFooterStatus.checkedAt < QUOTA_CHECK_CACHE_TTL_MS) {
+    return cachedQuotaFooterStatus.value;
+  }
+
+  try {
+    const headers = await fetchQuotaCheckHeaders(options.apiKey, model.baseUrl, options?.headers);
+    if (!headers) return null;
+    const footerStatus = getClaudeFooterStatus(headers);
+    cachedQuotaFooterStatus = { keyHash, value: footerStatus, checkedAt: Date.now() };
+    return footerStatus;
+  } catch (error) {
+    log("quota_check_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function createAnthropicErrorEvent(model: Model<"anthropic-messages">, message: string): AssistantMessageEvent {
+  return {
+    type: "error",
+    reason: "error",
+    error: {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "error",
+      errorMessage: message,
+      timestamp: Date.now(),
+    },
+  };
+}
+
+function applyFooterStatusToCurrentContext(footerStatus: ClaudeFooterStatus): void {
+  if (!latestCtx || !shouldApply(latestCtx)) return;
+
+  setAdapterStatus(latestCtx, {
+    phase: "warning",
+    applies: true,
+    suppressWarning: true,
+    docsSource: adapterStatus.docsSource,
+    billingHeader: adapterStatus.billingHeader,
+    reason: "Resolved Claude usage state from Anthropic quota check",
+    statusText: footerStatus.message,
+  });
 }
 
 function getLogFile(): string | null {
@@ -192,17 +589,22 @@ function renderAdapterStatus(ctx: ExtensionContext): void {
 
   const theme = ctx.ui.theme;
   if (adapterStatus.phase === "ready") {
-    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", "✓ Claude OAuth ready"));
+    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", adapterStatus.statusText || "✓ Claude OAuth ready"));
     return;
   }
 
   if (adapterStatus.phase === "active") {
-    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", "✓ Claude OAuth active"));
+    ctx.ui.setStatus(READY_STATUS_KEY, theme.fg("success", adapterStatus.statusText || "✓ Claude OAuth active"));
+    return;
+  }
+
+  if (adapterStatus.phase === "warning") {
+    ctx.ui.setStatus(ISSUE_STATUS_KEY, theme.fg("warning", adapterStatus.statusText || "Claude usage limit"));
     return;
   }
 
   if (adapterStatus.phase === "issue") {
-    ctx.ui.setStatus(ISSUE_STATUS_KEY, theme.fg("warning", "⚠ Claude OAuth setup"));
+    ctx.ui.setStatus(ISSUE_STATUS_KEY, theme.fg("warning", adapterStatus.statusText || "⚠ Claude OAuth setup"));
   }
 }
 
@@ -293,6 +695,8 @@ function resolveDocsSection(systemPrompt: string): ResolvedDocsSection {
 }
 
 function syncSetupStatus(ctx: ExtensionContext, systemPrompt: string): ResolvedDocsSection {
+  latestCtx = ctx;
+
   if (!shouldApply(ctx)) {
     setAdapterStatus(ctx, {
       phase: "inactive",
@@ -301,6 +705,7 @@ function syncSetupStatus(ctx: ExtensionContext, systemPrompt: string): ResolvedD
       docsSource: "missing",
       billingHeader: "unknown",
       reason: "Not using Anthropic OAuth",
+      statusText: "",
     });
     return { extracted: null, docsSection: null, docsSource: "missing" };
   }
@@ -314,6 +719,7 @@ function syncSetupStatus(ctx: ExtensionContext, systemPrompt: string): ResolvedD
       docsSource: resolved.docsSource,
       billingHeader: "unknown",
       reason: "No Pi docs context available to rehydrate Anthropic OAuth requests",
+      statusText: "⚠ Claude OAuth setup",
     });
     return resolved;
   }
@@ -330,6 +736,7 @@ function syncSetupStatus(ctx: ExtensionContext, systemPrompt: string): ResolvedD
     docsSource: resolved.docsSource,
     billingHeader: adapterStatus.billingHeader,
     reason: nextReason,
+    statusText: nextPhase === "ready" ? "✓ Claude OAuth ready" : adapterStatus.statusText,
   });
 
   return resolved;
@@ -462,8 +869,14 @@ function ensurePromptBlock(blocks: TextBlock[], ctx: ExtensionContext): TextBloc
   ];
 }
 
-function normalizeSystemBlocks(blocks: TextBlock[], ctx: ExtensionContext, messages: unknown): { blocks: TextBlock[]; billingAdded: boolean } {
-  let billingAdded = false;
+function normalizeSystemBlocks(
+  blocks: TextBlock[],
+  ctx: ExtensionContext,
+  messages: unknown,
+): { blocks: TextBlock[]; billingState: BillingHeaderState } {
+  const billingHeader = buildBillingHeader(messages);
+  let billingState: BillingHeaderState = "unknown";
+  let sawBillingHeader = false;
   const nextBlocks: TextBlock[] = [];
 
   for (const block of blocks) {
@@ -472,7 +885,15 @@ function normalizeSystemBlocks(blocks: TextBlock[], ctx: ExtensionContext, messa
     }
 
     if (block.text.startsWith("x-anthropic-billing-header:")) {
-      nextBlocks.push(cloneBlock(block));
+      if (sawBillingHeader) continue;
+      sawBillingHeader = true;
+      if (block.text === billingHeader) {
+        billingState = "present";
+        nextBlocks.push(cloneBlock(block));
+      } else {
+        billingState = "updated";
+        nextBlocks.push({ ...cloneBlock(block), text: billingHeader });
+      }
       continue;
     }
 
@@ -488,15 +909,70 @@ function normalizeSystemBlocks(blocks: TextBlock[], ctx: ExtensionContext, messa
     nextBlocks.push({ ...cloneBlock(block), text: extracted.strippedPrompt });
   }
 
-  if (!nextBlocks.some((block) => block.text.startsWith("x-anthropic-billing-header:"))) {
-    nextBlocks.unshift({ type: "text", text: buildBillingHeader(messages) });
-    billingAdded = true;
+  if (!sawBillingHeader) {
+    nextBlocks.unshift({ type: "text", text: billingHeader });
+    billingState = "injected";
   }
 
-  return { blocks: ensurePromptBlock(nextBlocks, ctx), billingAdded };
+  return { blocks: ensurePromptBlock(nextBlocks, ctx), billingState };
 }
 
 export default function claudeOauthAdapter(pi: ExtensionAPI) {
+  pi.registerProvider("anthropic", {
+    api: "anthropic-messages",
+    streamSimple: (model: Model<"anthropic-messages">, context: Context, options?: SimpleStreamOptions) => {
+      log("custom_stream_invoked", {
+        model: model.id,
+        provider: model.provider,
+        isOAuth: isAnthropicOAuthToken(options?.apiKey),
+      });
+      if (!isAnthropicOAuthToken(options?.apiKey)) {
+        return streamSimpleAnthropic(model, context, options);
+      }
+
+      const outer = createAssistantMessageEventStream();
+
+      void (async () => {
+        try {
+          const preflightFooterStatus = await resolveAnthropicQuotaFooterStatus(model, options);
+          if (preflightFooterStatus?.severity === "error") {
+            log("custom_stream_preflight_rejected", { message: preflightFooterStatus.message });
+            applyFooterStatusToCurrentContext(preflightFooterStatus);
+            outer.push(createAnthropicErrorEvent(model, preflightFooterStatus.message));
+            return;
+          }
+
+          if (preflightFooterStatus?.severity === "warning") {
+            log("custom_stream_preflight_warning", { message: preflightFooterStatus.message });
+            applyFooterStatusToCurrentContext(preflightFooterStatus);
+          }
+
+          const inner = streamSimpleAnthropic(model, context, options);
+          for await (const event of inner) {
+            log("custom_stream_event", { type: event.type, hasErrorMessage: event.type === "error" ? !!event.error.errorMessage : false });
+            if (event.type === "error" && isAnthropicRateLimitError(event.error.errorMessage)) {
+              log("custom_stream_rate_limit", { message: event.error.errorMessage });
+              const footerStatus = await resolveAnthropicQuotaFooterStatus(model, options);
+              if (footerStatus) {
+                log("custom_stream_quota_resolved", { message: footerStatus.message, severity: footerStatus.severity });
+                applyFooterStatusToCurrentContext(footerStatus);
+                outer.push(createAnthropicErrorEvent(model, footerStatus.message));
+                continue;
+              }
+            }
+
+            outer.push(event);
+          }
+          outer.end();
+        } catch (error) {
+          outer.push(createAnthropicErrorEvent(model, error instanceof Error ? error.message : String(error)));
+        }
+      })();
+
+      return outer;
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
     syncSetupStatus(ctx, ctx.getSystemPrompt());
   });
@@ -544,6 +1020,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
   });
 
   pi.on("context", (event, ctx) => {
+    latestCtx = ctx;
     if (!shouldApply(ctx) || !activeTurn) return;
     const nextMessages = injectDocs(event.messages, activeTurn);
     log("context", {
@@ -556,13 +1033,14 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", (event, ctx) => {
+    latestCtx = ctx;
     if (!shouldApply(ctx) || !isPayloadLike(event.payload)) return;
 
     const currentBlocks = Array.isArray(event.payload.system) ? event.payload.system.filter(isTextBlock) : [];
-    const hadBillingHeader = currentBlocks.some((block) => block.text.startsWith("x-anthropic-billing-header:"));
     const normalized = normalizeSystemBlocks(currentBlocks, ctx, event.payload.messages);
     const changed =
-      normalized.billingAdded ||
+      normalized.billingState === "injected" ||
+      normalized.billingState === "updated" ||
       normalized.blocks.length !== currentBlocks.length ||
       normalized.blocks.some((block, index) => currentBlocks[index]?.text !== block.text);
 
@@ -570,22 +1048,28 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
       ? { ...event.payload, system: normalized.blocks }
       : event.payload;
 
+    const reason =
+      normalized.billingState === "injected"
+        ? "Injected Claude billing header into Anthropic OAuth request"
+        : normalized.billingState === "updated"
+          ? "Updated Claude billing header to Claude Code 2.1.118 shape"
+          : normalized.billingState === "present"
+            ? "Anthropic OAuth request already includes Claude billing header"
+            : "Normalized Anthropic OAuth request";
+
     setAdapterStatus(ctx, {
       phase: "active",
       applies: true,
       suppressWarning: true,
       docsSource: adapterStatus.docsSource === "missing" ? "fallback" : adapterStatus.docsSource,
-      billingHeader: normalized.billingAdded ? "injected" : hadBillingHeader ? "present" : "unknown",
-      reason: normalized.billingAdded
-        ? "Injected Claude billing header into Anthropic OAuth request"
-        : hadBillingHeader
-          ? "Anthropic OAuth request already includes Claude billing header"
-          : "Normalized Anthropic OAuth request",
+      billingHeader: normalized.billingState,
+      reason,
+      statusText: "✓ Claude OAuth active",
     });
 
     log("before_provider_request", {
       changed,
-      billingAdded: normalized.billingAdded,
+      billingState: normalized.billingState,
       docsSource: adapterStatus.docsSource,
       suppressWarning: adapterStatus.suppressWarning,
       systemBefore: currentBlocks.map((block, index) => `${index}: ${block.text.slice(0, 140)}`),
@@ -598,7 +1082,29 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
   });
 
   pi.on("after_provider_response", (event, ctx) => {
+    latestCtx = ctx;
     if (!shouldApply(ctx)) return;
+
+    const footerStatus = getClaudeFooterStatus(event.headers);
+    log("after_provider_response", {
+      status: event.status,
+      unifiedRateLimitHeaders: getUnifiedRateLimitHeaders(event.headers),
+      footerStatus,
+    });
+
+    if (footerStatus) {
+      setAdapterStatus(ctx, {
+        phase: "warning",
+        applies: true,
+        suppressWarning: true,
+        docsSource: adapterStatus.docsSource,
+        billingHeader: adapterStatus.billingHeader,
+        reason: `Anthropic OAuth request reported Claude usage state (${event.status})`,
+        statusText: footerStatus.message,
+      });
+      return;
+    }
+
     if (event.status >= 400) {
       setAdapterStatus(ctx, {
         phase: "issue",
@@ -607,17 +1113,19 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
         docsSource: adapterStatus.docsSource,
         billingHeader: adapterStatus.billingHeader,
         reason: `Anthropic OAuth request failed with HTTP ${event.status}`,
+        statusText: "⚠ Claude OAuth setup",
       });
       return;
     }
 
-    if (adapterStatus.phase === "active") {
+    if (adapterStatus.phase === "active" || adapterStatus.phase === "warning") {
       setAdapterStatus(ctx, {
         ...adapterStatus,
         phase: "active",
         applies: true,
         suppressWarning: true,
         reason: `Anthropic OAuth request succeeded (${event.status})`,
+        statusText: "✓ Claude OAuth active",
       });
     }
   });
@@ -627,6 +1135,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    latestCtx = null;
     activeTurn = null;
     adapterStatus = {
       phase: "inactive",
@@ -635,6 +1144,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
       docsSource: "missing",
       billingHeader: "unknown",
       reason: "Session ended",
+      statusText: "",
     };
     clearAdapterStatuses(ctx);
   });
