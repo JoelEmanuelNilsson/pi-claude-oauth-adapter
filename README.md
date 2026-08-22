@@ -6,6 +6,18 @@ Anthropic OAuth / Claude Code compatibility adapter for Pi.
 
 This package patches Anthropic OAuth / Claude Pro/Max sessions in Pi. It strips the docs-only Pi section out of the system prompt, removes the Claude Code identity block, reinjects Pi docs context outside the system prompt when needed, and makes sure the Claude billing header is present for OAuth requests.
 
+## What's new in 0.2.0
+
+- The injected Claude billing header now tracks Claude Code `2.1.226`; `cch=00000` is only included for first-party Anthropic requests.
+- The quota probe now uses Claude Code's external CLI user agent, sends only the OAuth beta for the Haiku probe, and tries `GET /api/oauth/usage` before falling back to a tiny messages request.
+- Unified usage-limit parsing now understands `7d_oi` / Fable 5 limits, overage utilization, overage in-use state, usage-credit wording, and grace-window warnings.
+
+## What's new in 0.1.4
+
+- The injected Claude billing header now tracks Claude Code `2.1.126` (`cc_version` hash input, entrypoint, fixed `cch=00000`, optional `cc_workload`).
+- Unified usage-limit parsing now preserves the latest `anthropic-ratelimit-unified-fallback` and `anthropic-ratelimit-unified-upgrade-paths` fields.
+- 429 responses that include representative-claim or overage headers but omit `anthropic-ratelimit-unified-status` are treated as rejected, matching Claude Code's current fallback path.
+
 ## What's new in 0.1.3
 
 - Pi now surfaces Claude unified usage-limit state on the real 429 path, including a follow-up quota check that rewrites generic Anthropic rate-limit failures into Claude-style messages like `You've hit your limit · resets 10:30pm (Asia/Colombo)`.

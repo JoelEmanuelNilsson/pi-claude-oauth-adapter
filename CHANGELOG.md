@@ -2,6 +2,20 @@
 
 All notable changes to `pi-claude-oauth-adapter` live here.
 
+## 0.2.0 — 2026-08-08
+
+- Sync the injected Claude billing header to Claude Code `2.1.226`, including conditional first-party `cch=00000` handling.
+- Match the Claude Code quota probe more closely with the external CLI user agent and OAuth-only beta header for the Haiku probe.
+- Prefer Claude Code's `GET /api/oauth/usage` check before falling back to the synthetic `max_tokens: 1` messages probe.
+- Parse new unified rate-limit metadata for `7d_oi` / Fable 5 limits, overage utilization, overage in-use state, and grace-window warnings.
+- Update usage-credit labels and disabled-reason messages to match the current Claude Code wording.
+
+## 0.1.4 — 2026-05-03
+
+- Sync the injected Claude billing header to Claude Code `2.1.126` while keeping the same hash salt and message-character sampling shape.
+- Preserve newly observed unified rate-limit metadata (`fallback` availability and comma-separated `upgrade-paths`) for debug/status decisions.
+- Treat 429 responses with representative-claim or overage headers but no explicit unified status as rejected, matching Claude Code's current fallback error path.
+
 ## 0.1.3 — 2026-04-23
 
 - Surface Claude usage-limit state on the real 429 path by running a follow-up quota check and rewriting Anthropic's generic `rate_limit_error` into Claude-style limit/reset messages.

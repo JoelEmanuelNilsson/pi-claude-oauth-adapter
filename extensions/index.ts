@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { createAssistantMessageEventStream, streamSimpleAnthropic, type AssistantMessageEvent, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
+import { createAssistantMessageEventStream, streamSimpleAnthropic, type Api, type AssistantMessageEvent, type Context, type Model, type SimpleStreamOptions } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 const DOCS_MARKER =
@@ -14,7 +14,7 @@ const ISSUE_STATUS_KEY = "claude-oauth-issue";
 const END_MARKERS = ["\n\n# Project Context", "\n\n<available_skills>", "\nCurrent date:"] as const;
 const PI_TOPIC_REGEX =
   /\b(pi|@mariozechner\/pi-|pi-mono|coding agent harness|pi sdk|pi extension|pi theme|pi skill|pi tui|pi package|prompt templates?|keybindings?|custom providers?|adding models?)\b/i;
-const DEFAULT_CLAUDE_CODE_VERSION = "2.1.118";
+const DEFAULT_CLAUDE_CODE_VERSION = "2.1.226";
 const BILLING_SALT = "59cf53e54c78";
 const DEFAULT_ENTRYPOINT = "pi";
 const DEFAULT_BILLING_CCH = "00000";
@@ -23,6 +23,7 @@ const QUOTA_CHECK_CACHE_TTL_MS = 30_000;
 const SURPASSED_THRESHOLD_CLAIMS = [
   { claimAbbrev: "5h", rateLimitType: "five_hour" },
   { claimAbbrev: "7d", rateLimitType: "seven_day" },
+  { claimAbbrev: "7d_oi", rateLimitType: "seven_day_overage_included" },
   { claimAbbrev: "overage", rateLimitType: "overage" },
 ] as const;
 const RATE_LIMIT_WARNING_CONFIG = [
@@ -49,7 +50,7 @@ type ReinjectionScope = "never" | "always" | "pi-only";
 type DocsSource = "system" | "fallback" | "missing";
 type BillingHeaderState = "unknown" | "present" | "updated" | "injected";
 type AdapterPhase = "inactive" | "ready" | "active" | "warning" | "issue";
-type ClaudeRateLimitType = "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "overage";
+type ClaudeRateLimitType = "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet" | "seven_day_overage_included" | "overage";
 type ClaudeRateLimitStatus = "allowed" | "allowed_warning" | "rejected";
 type ClaudeOverageStatus = "allowed" | "allowed_warning" | "rejected";
 
@@ -79,6 +80,14 @@ interface ClaudeRateLimitState {
   overageStatus?: ClaudeOverageStatus;
   overageResetsAt?: number;
   overageDisabledReason?: string;
+  overageInUse?: boolean;
+  overageUtilization?: number;
+  overageSurpassedThreshold?: number;
+  overagePeriodMonthlyUtilization?: number;
+  overagePeriodChannelUtilization?: number;
+  rateLimitGraceActive?: boolean;
+  upgradePaths?: string[];
+  unifiedRateLimitFallbackAvailable: boolean;
   isUsingOverage: boolean;
 }
 
@@ -203,7 +212,21 @@ function getBillingMessageText(content: unknown): string {
     .join("\n");
 }
 
-function buildBillingHeader(messages: unknown, entrypoint: string = getEntrypoint()): string {
+function isFirstPartyAnthropicBaseUrl(baseUrl: string | undefined): boolean {
+  const value = baseUrl ?? process.env.ANTHROPIC_BASE_URL;
+  if (!value) return true;
+  try {
+    return new URL(value).host === "api.anthropic.com";
+  } catch {
+    return false;
+  }
+}
+
+function getClaudeUserAgent(): string {
+  return `claude-cli/${getClaudeCodeVersion()} (external, ${getEntrypoint()})`;
+}
+
+function buildBillingHeader(messages: unknown, entrypoint: string = getEntrypoint(), includeCch: boolean = isFirstPartyAnthropicBaseUrl(undefined)): string {
   const list = Array.isArray(messages) ? messages : [];
   const firstUserMessage = list.find((message) => isObject(message) && message.role === "user") as Record<string, unknown> | undefined;
   const messageText = firstUserMessage ? getBillingMessageText(firstUserMessage.content) : "";
@@ -212,7 +235,8 @@ function buildBillingHeader(messages: unknown, entrypoint: string = getEntrypoin
   const versionHash = sha256Hex(`${BILLING_SALT}${sampledChars}${version}`).slice(0, 3);
   const workload = getClaudeCodeWorkload();
   const workloadSuffix = workload ? ` cc_workload=${workload};` : "";
-  return `x-anthropic-billing-header: cc_version=${version}.${versionHash}; cc_entrypoint=${entrypoint}; cch=${DEFAULT_BILLING_CCH};${workloadSuffix}`;
+  const cchSuffix = includeCch ? ` cch=${DEFAULT_BILLING_CCH};` : "";
+  return `x-anthropic-billing-header: cc_version=${version}.${versionHash}; cc_entrypoint=${entrypoint};${cchSuffix}${workloadSuffix}`;
 }
 
 function getHeader(headers: Record<string, string>, name: string): string | undefined {
@@ -235,7 +259,7 @@ function hasUnifiedRateLimitHeaders(headers: Record<string, string>): boolean {
 }
 
 function isClaudeRateLimitType(value: string | undefined): value is ClaudeRateLimitType {
-  return value === "five_hour" || value === "seven_day" || value === "seven_day_opus" || value === "seven_day_sonnet" || value === "overage";
+  return value === "five_hour" || value === "seven_day" || value === "seven_day_opus" || value === "seven_day_sonnet" || value === "seven_day_overage_included" || value === "overage";
 }
 
 function isClaudeRateLimitStatus(value: string | undefined): value is ClaudeRateLimitStatus {
@@ -252,7 +276,12 @@ function getResetProgress(resetAt: number, windowSeconds: number): number {
   return Math.max(0, Math.min(1, (now - startedAt) / windowSeconds));
 }
 
-function getWarningRateLimitState(headers: Record<string, string>): ClaudeRateLimitState | null {
+// Warning state from this helper is always merged with `upgradePaths` and
+// `unifiedRateLimitFallbackAvailable` by the caller, so we deliberately omit
+// those fields here to avoid setting defaults that would be silently overridden.
+type WarningRateLimitState = Omit<ClaudeRateLimitState, "upgradePaths" | "unifiedRateLimitFallbackAvailable">;
+
+function getWarningRateLimitState(headers: Record<string, string>): WarningRateLimitState | null {
   for (const { claimAbbrev, rateLimitType } of SURPASSED_THRESHOLD_CLAIMS) {
     const surpassedThreshold = getHeader(headers, `anthropic-ratelimit-unified-${claimAbbrev}-surpassed-threshold`);
     if (surpassedThreshold === undefined) continue;
@@ -287,21 +316,66 @@ function getWarningRateLimitState(headers: Record<string, string>): ClaudeRateLi
   return null;
 }
 
-function parseClaudeRateLimitState(headers: Record<string, string>): ClaudeRateLimitState | null {
+function parseUpgradePaths(headers: Record<string, string>): string[] | undefined {
+  const value = getHeader(headers, "anthropic-ratelimit-unified-upgrade-paths");
+  if (!value) return undefined;
+
+  const paths = value.split(",").map((path) => path.trim()).filter((path) => path.length > 0);
+  return paths.length > 0 ? paths : undefined;
+}
+
+function resolveRateLimitStatus(headers: Record<string, string>, httpStatus?: number): ClaudeRateLimitStatus {
+  const statusHeader = getHeader(headers, "anthropic-ratelimit-unified-status");
+  if (isClaudeRateLimitStatus(statusHeader)) return statusHeader;
+
+  const hasRepresentativeClaim = getHeader(headers, "anthropic-ratelimit-unified-representative-claim") !== undefined;
+  const hasOverageStatus = getHeader(headers, "anthropic-ratelimit-unified-overage-status") !== undefined;
+  // Match Claude Code's `rl_` fallback in decoded/2490.js: a 429 with rate-limit
+  // representative-claim or overage headers is treated as `rejected`. We pin to
+  // exactly 429 because 5xx errors don't carry these headers and we don't want
+  // the rate-limit footer to fire on unrelated server failures.
+  if (httpStatus === 429 && (hasRepresentativeClaim || hasOverageStatus)) return "rejected";
+
+  return "allowed";
+}
+
+function parseClaudeRateLimitState(headers: Record<string, string>, httpStatus?: number): ClaudeRateLimitState | null {
   if (!hasUnifiedRateLimitHeaders(headers)) return null;
 
-  const statusHeader = getHeader(headers, "anthropic-ratelimit-unified-status");
-  const status: ClaudeRateLimitStatus = isClaudeRateLimitStatus(statusHeader) ? statusHeader : "allowed";
+  const status = resolveRateLimitStatus(headers, httpStatus);
   const rateLimitTypeHeader = getHeader(headers, "anthropic-ratelimit-unified-representative-claim");
   const rateLimitType = isClaudeRateLimitType(rateLimitTypeHeader) ? rateLimitTypeHeader : undefined;
   const overageStatusHeader = getHeader(headers, "anthropic-ratelimit-unified-overage-status");
   const overageStatus = isClaudeOverageStatus(overageStatusHeader) ? overageStatusHeader : undefined;
   const overageResetsAt = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-reset");
   const overageDisabledReason = getHeader(headers, "anthropic-ratelimit-unified-overage-disabled-reason");
+  const overageInUse = getHeader(headers, "anthropic-ratelimit-unified-overage-in-use") === "true";
+  const overageUtilization = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-utilization");
+  const overageSurpassedThreshold = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-surpassed-threshold");
+  const overagePeriodMonthlyUtilization = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-period-monthly-utilization");
+  const overagePeriodChannelUtilization = parseNumberHeader(headers, "anthropic-ratelimit-unified-overage-period-channel-utilization");
+  const graceStatus = getHeader(headers, "anthropic-ratelimit-unified-grace-status");
+  const graceFiveHourUtilization = parseNumberHeader(headers, "anthropic-ratelimit-unified-grace-5h-utilization") ?? 0;
+  const graceSevenDayUtilization = parseNumberHeader(headers, "anthropic-ratelimit-unified-grace-7d-utilization") ?? 0;
+  const rateLimitGraceActive = graceStatus !== undefined && Math.max(graceFiveHourUtilization, graceSevenDayUtilization) > 0;
+  const upgradePaths = parseUpgradePaths(headers);
+  const unifiedRateLimitFallbackAvailable = getHeader(headers, "anthropic-ratelimit-unified-fallback") === "available";
 
   if (status === "allowed" || status === "allowed_warning") {
     const warningState = getWarningRateLimitState(headers);
-    if (warningState) return warningState;
+    if (warningState) {
+      return {
+        ...warningState,
+        upgradePaths,
+        unifiedRateLimitFallbackAvailable,
+        overageInUse,
+        overageUtilization,
+        overageSurpassedThreshold,
+        overagePeriodMonthlyUtilization,
+        overagePeriodChannelUtilization,
+        rateLimitGraceActive,
+      };
+    }
   }
 
   return {
@@ -311,6 +385,14 @@ function parseClaudeRateLimitState(headers: Record<string, string>): ClaudeRateL
     overageStatus,
     overageResetsAt,
     overageDisabledReason,
+    overageInUse,
+    overageUtilization,
+    overageSurpassedThreshold,
+    overagePeriodMonthlyUtilization,
+    overagePeriodChannelUtilization,
+    rateLimitGraceActive,
+    upgradePaths,
+    unifiedRateLimitFallbackAvailable,
     isUsingOverage: status === "rejected" && (overageStatus === "allowed" || overageStatus === "allowed_warning"),
   };
 }
@@ -356,8 +438,10 @@ function getRateLimitLabel(rateLimitType: ClaudeRateLimitType | undefined): stri
       const subscriptionType = getClaudeSubscriptionType();
       return subscriptionType === "pro" || subscriptionType === "enterprise" ? "weekly limit" : "Sonnet limit";
     }
+    case "seven_day_overage_included":
+      return "Fable 5 limit";
     case "overage":
-      return "extra usage";
+      return "usage credit limit";
     default:
       return null;
   }
@@ -379,10 +463,28 @@ function formatRejectedRateLimitMessage(state: ClaudeRateLimitState): string {
     }
 
     if (state.overageDisabledReason === "out_of_credits") {
-      return `You're out of extra usage${overageSuffix}`;
+      return `You're out of usage credits${overageSuffix}`;
+    }
+    if (state.overageDisabledReason === "org_spend_cap_reached") {
+      return `Your org is out of usage${overageSuffix}`;
+    }
+    if (state.overageDisabledReason === "seat_tier_level_disabled" || state.overageDisabledReason === "seat_tier_zero_credit_limit") {
+      return "Your seat type doesn't include usage credits";
+    }
+    if (state.overageDisabledReason === "org_service_level_disabled") {
+      return "This service is disabled for your org";
+    }
+    if (state.overageDisabledReason === "member_level_disabled" || state.overageDisabledReason === "member_zero_credit_limit") {
+      return "Your usage allocation has been disabled by your admin";
+    }
+    if (state.overageDisabledReason === "group_zero_credit_limit") {
+      return "Your group's usage limit is set to $0";
+    }
+    if (state.overageDisabledReason === "org_level_disabled_until") {
+      return `Your org's monthly usage limit has been reached${overageSuffix}`;
     }
 
-    return `You've hit your limit${overageSuffix}`;
+    return `You've hit your usage limit${overageSuffix}`;
   }
 
   const label = getRateLimitLabel(state.rateLimitType);
@@ -395,8 +497,6 @@ function formatWarningRateLimitMessage(state: ClaudeRateLimitState): string | nu
 
   const utilizationPct = typeof state.utilization === "number" ? Math.floor(state.utilization * 100) : undefined;
   const resetText = state.resetsAt ? formatResetTime(state.resetsAt, true) : undefined;
-  const normalizedLabel = state.rateLimitType === "overage" ? `${label} limit` : label;
-
   if (utilizationPct !== undefined && resetText) {
     return `You've used ${utilizationPct}% of your ${label} · resets ${resetText}`;
   }
@@ -406,25 +506,29 @@ function formatWarningRateLimitMessage(state: ClaudeRateLimitState): string | nu
   }
 
   if (resetText) {
-    return `Approaching ${normalizedLabel} · resets ${resetText}`;
+    return `Approaching ${label} · resets ${resetText}`;
   }
 
-  return `Approaching ${normalizedLabel}`;
+  return `Approaching ${label}`;
 }
 
-function getClaudeFooterStatus(headers: Record<string, string>): ClaudeFooterStatus | null {
-  const state = parseClaudeRateLimitState(headers);
+function getClaudeFooterStatus(headers: Record<string, string>, httpStatus?: number): ClaudeFooterStatus | null {
+  const state = parseClaudeRateLimitState(headers, httpStatus);
   if (!state) return null;
+
+  if (state.status === "rejected" && !state.isUsingOverage) {
+    return { message: formatRejectedRateLimitMessage(state), severity: "error" };
+  }
+
+  if (state.rateLimitGraceActive) {
+    return { message: "Usage limit reached — grace window active. Wrap up or checkpoint soon.", severity: "warning" };
+  }
 
   if (state.isUsingOverage) {
     if (state.overageStatus === "allowed_warning") {
-      return { message: "You're close to your extra usage spending limit", severity: "warning" };
+      return { message: "You're close to your usage credit limit", severity: "warning" };
     }
     return null;
-  }
-
-  if (state.status === "rejected") {
-    return { message: formatRejectedRateLimitMessage(state), severity: "error" };
   }
 
   if (state.status === "allowed_warning") {
@@ -442,7 +546,7 @@ function getUnifiedRateLimitHeaders(headers: Record<string, string>): Record<str
   );
 }
 
-function isAnthropicOAuthToken(apiKey: string | undefined): boolean {
+function isAnthropicOAuthToken(apiKey: string | undefined): apiKey is string {
   return typeof apiKey === "string" && apiKey.includes("sk-ant-oat");
 }
 
@@ -458,24 +562,98 @@ function getQuotaCheckUrl(baseUrl: string | undefined): string {
   return `${normalizedBaseUrl}/v1/messages`;
 }
 
+function getOAuthUsageUrl(baseUrl: string | undefined): string | null {
+  if (!isFirstPartyAnthropicBaseUrl(baseUrl)) return null;
+  return "https://api.anthropic.com/api/oauth/usage";
+}
+
+function parseUsageReset(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.round(timestamp / 1000) : undefined;
+}
+
+function getUsageLimit(value: unknown): { utilization: number; resetsAt?: number } | null {
+  if (!isObject(value) || typeof value.utilization !== "number" || !Number.isFinite(value.utilization)) return null;
+  return { utilization: value.utilization / 100, resetsAt: parseUsageReset(value.resets_at) };
+}
+
+function usageResponseToRateLimitHeaders(value: unknown): Record<string, string> | null {
+  if (!isObject(value)) return null;
+  const candidates: Array<{ type: ClaudeRateLimitType; value: { utilization: number; resetsAt?: number } | null }> = [
+    { type: "five_hour", value: getUsageLimit(value.five_hour) },
+    { type: "seven_day", value: getUsageLimit(value.seven_day) },
+    { type: "seven_day_opus", value: getUsageLimit(value.seven_day_opus) },
+    { type: "seven_day_sonnet", value: getUsageLimit(value.seven_day_sonnet) },
+  ];
+  const representative = candidates
+    .filter((candidate): candidate is { type: ClaudeRateLimitType; value: { utilization: number; resetsAt?: number } } =>
+      candidate.value !== null && candidate.value.utilization >= 1,
+    )
+    .sort((a, b) => b.value.utilization - a.value.utilization)[0];
+  const extraUsage = isObject(value.extra_usage) ? value.extra_usage : null;
+  const disabledReason = extraUsage && typeof extraUsage.disabled_reason === "string" ? extraUsage.disabled_reason : undefined;
+  if (!representative && !disabledReason) return null;
+
+  const result: Record<string, string> = {
+    "anthropic-ratelimit-unified-status": "rejected",
+  };
+  if (representative) {
+    result["anthropic-ratelimit-unified-representative-claim"] = representative.type;
+    if (representative.value.resetsAt !== undefined) {
+      result["anthropic-ratelimit-unified-reset"] = String(representative.value.resetsAt);
+    }
+  }
+  if (disabledReason) {
+    result["anthropic-ratelimit-unified-overage-status"] = "rejected";
+    result["anthropic-ratelimit-unified-overage-disabled-reason"] = disabledReason;
+  }
+  return result;
+}
+
 async function fetchQuotaCheckHeaders(
   apiKey: string,
   baseUrl: string | undefined,
   headers: Record<string, string> | undefined,
-): Promise<Record<string, string> | null> {
+): Promise<{ headers: Record<string, string>; status: number } | null> {
+  const usageUrl = getOAuthUsageUrl(baseUrl);
+  const sharedHeaders = {
+    accept: "application/json",
+    authorization: `Bearer ${apiKey}`,
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true",
+    "anthropic-beta": "oauth-2025-04-20",
+    "user-agent": getClaudeUserAgent(),
+    "x-app": "cli",
+    ...headers,
+  };
+
+  if (usageUrl) {
+    const usageResponse = await fetch(usageUrl, {
+      method: "GET",
+      headers: sharedHeaders,
+    });
+    const usageHeaders = Object.fromEntries(usageResponse.headers.entries());
+    if (hasUnifiedRateLimitHeaders(usageHeaders)) {
+      return { headers: usageHeaders, status: usageResponse.status };
+    }
+    if (usageResponse.ok) {
+      const usageBody: unknown = await usageResponse.json();
+      const synthesizedHeaders = usageResponseToRateLimitHeaders(usageBody);
+      if (synthesizedHeaders) return { headers: synthesizedHeaders, status: 429 };
+    }
+  }
+
   const response = await fetch(getQuotaCheckUrl(baseUrl), {
     method: "POST",
     headers: {
-      accept: "application/json",
-      authorization: `Bearer ${apiKey}`,
-      "content-type": "application/json",
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-      "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
-      "user-agent": `claude-cli/${getClaudeCodeVersion()}`,
-      "x-app": "cli",
-      "x-anthropic-billing-header": buildBillingHeader([{ role: "user", content: "quota" }]),
-      ...headers,
+      ...sharedHeaders,
+      "x-anthropic-billing-header": buildBillingHeader(
+        [{ role: "user", content: "quota" }],
+        getEntrypoint(),
+        isFirstPartyAnthropicBaseUrl(baseUrl),
+      ),
     },
     body: JSON.stringify({
       model: QUOTA_CHECK_MODEL,
@@ -484,24 +662,25 @@ async function fetchQuotaCheckHeaders(
     }),
   });
 
-  return Object.fromEntries(response.headers.entries());
+  return { headers: Object.fromEntries(response.headers.entries()), status: response.status };
 }
 
 async function resolveAnthropicQuotaFooterStatus(
   model: Model<"anthropic-messages">,
   options: SimpleStreamOptions | undefined,
 ): Promise<ClaudeFooterStatus | null> {
-  if (!isAnthropicOAuthToken(options?.apiKey)) return null;
+  const apiKey = options?.apiKey;
+  if (!isAnthropicOAuthToken(apiKey)) return null;
 
-  const keyHash = sha256Hex(options.apiKey);
+  const keyHash = sha256Hex(apiKey);
   if (cachedQuotaFooterStatus && cachedQuotaFooterStatus.keyHash === keyHash && Date.now() - cachedQuotaFooterStatus.checkedAt < QUOTA_CHECK_CACHE_TTL_MS) {
     return cachedQuotaFooterStatus.value;
   }
 
   try {
-    const headers = await fetchQuotaCheckHeaders(options.apiKey, model.baseUrl, options?.headers);
-    if (!headers) return null;
-    const footerStatus = getClaudeFooterStatus(headers);
+    const quotaCheck = await fetchQuotaCheckHeaders(apiKey, model.baseUrl, options?.headers);
+    if (!quotaCheck) return null;
+    const footerStatus = getClaudeFooterStatus(quotaCheck.headers, quotaCheck.status);
     cachedQuotaFooterStatus = { keyHash, value: footerStatus, checkedAt: Date.now() };
     return footerStatus;
   } catch (error) {
@@ -920,25 +1099,26 @@ function normalizeSystemBlocks(
 export default function claudeOauthAdapter(pi: ExtensionAPI) {
   pi.registerProvider("anthropic", {
     api: "anthropic-messages",
-    streamSimple: (model: Model<"anthropic-messages">, context: Context, options?: SimpleStreamOptions) => {
+    streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => {
+      const anthropicModel = model as Model<"anthropic-messages">;
       log("custom_stream_invoked", {
-        model: model.id,
-        provider: model.provider,
+        model: anthropicModel.id,
+        provider: anthropicModel.provider,
         isOAuth: isAnthropicOAuthToken(options?.apiKey),
       });
       if (!isAnthropicOAuthToken(options?.apiKey)) {
-        return streamSimpleAnthropic(model, context, options);
+        return streamSimpleAnthropic(anthropicModel, context, options);
       }
 
       const outer = createAssistantMessageEventStream();
 
       void (async () => {
         try {
-          const preflightFooterStatus = await resolveAnthropicQuotaFooterStatus(model, options);
+          const preflightFooterStatus = await resolveAnthropicQuotaFooterStatus(anthropicModel, options);
           if (preflightFooterStatus?.severity === "error") {
             log("custom_stream_preflight_rejected", { message: preflightFooterStatus.message });
             applyFooterStatusToCurrentContext(preflightFooterStatus);
-            outer.push(createAnthropicErrorEvent(model, preflightFooterStatus.message));
+            outer.push(createAnthropicErrorEvent(anthropicModel, preflightFooterStatus.message));
             return;
           }
 
@@ -947,16 +1127,16 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
             applyFooterStatusToCurrentContext(preflightFooterStatus);
           }
 
-          const inner = streamSimpleAnthropic(model, context, options);
+          const inner = streamSimpleAnthropic(anthropicModel, context, options);
           for await (const event of inner) {
             log("custom_stream_event", { type: event.type, hasErrorMessage: event.type === "error" ? !!event.error.errorMessage : false });
             if (event.type === "error" && isAnthropicRateLimitError(event.error.errorMessage)) {
               log("custom_stream_rate_limit", { message: event.error.errorMessage });
-              const footerStatus = await resolveAnthropicQuotaFooterStatus(model, options);
+              const footerStatus = await resolveAnthropicQuotaFooterStatus(anthropicModel, options);
               if (footerStatus) {
                 log("custom_stream_quota_resolved", { message: footerStatus.message, severity: footerStatus.severity });
                 applyFooterStatusToCurrentContext(footerStatus);
-                outer.push(createAnthropicErrorEvent(model, footerStatus.message));
+                outer.push(createAnthropicErrorEvent(anthropicModel, footerStatus.message));
                 continue;
               }
             }
@@ -965,7 +1145,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
           }
           outer.end();
         } catch (error) {
-          outer.push(createAnthropicErrorEvent(model, error instanceof Error ? error.message : String(error)));
+          outer.push(createAnthropicErrorEvent(anthropicModel, error instanceof Error ? error.message : String(error)));
         }
       })();
 
@@ -1052,7 +1232,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
       normalized.billingState === "injected"
         ? "Injected Claude billing header into Anthropic OAuth request"
         : normalized.billingState === "updated"
-          ? "Updated Claude billing header to Claude Code 2.1.118 shape"
+          ? "Updated Claude billing header to Claude Code 2.1.226 shape"
           : normalized.billingState === "present"
             ? "Anthropic OAuth request already includes Claude billing header"
             : "Normalized Anthropic OAuth request";
@@ -1085,7 +1265,7 @@ export default function claudeOauthAdapter(pi: ExtensionAPI) {
     latestCtx = ctx;
     if (!shouldApply(ctx)) return;
 
-    const footerStatus = getClaudeFooterStatus(event.headers);
+    const footerStatus = getClaudeFooterStatus(event.headers, event.status);
     log("after_provider_response", {
       status: event.status,
       unifiedRateLimitHeaders: getUnifiedRateLimitHeaders(event.headers),
