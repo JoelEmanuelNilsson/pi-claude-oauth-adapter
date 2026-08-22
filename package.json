@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-oauth-adapter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": false,
   "type": "module",
   "files": [
@@ -19,17 +19,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/minzique/dotfiles-agents.git",
-    "directory": "packages/pi-claude-oauth-adapter"
+    "url": "git+https://github.com/minzique/pi-claude-oauth-adapter.git"
   },
-  "homepage": "https://github.com/minzique/dotfiles-agents/tree/main/packages/pi-claude-oauth-adapter",
+  "homepage": "https://github.com/minzique/pi-claude-oauth-adapter#readme",
   "bugs": {
-    "url": "https://github.com/minzique/dotfiles-agents/issues"
+    "url": "https://github.com/minzique/pi-claude-oauth-adapter/issues"
   },
   "license": "MIT",
   "scripts": {
     "build": "echo 'nothing to build'",
-    "check": "echo 'nothing to check'"
+    "check": "tsc --noEmit",
+    "prepack": "npm run check"
   },
   "publishConfig": {
     "access": "public"
@@ -38,6 +38,10 @@
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
   },
   "pi": {
     "extensions": [

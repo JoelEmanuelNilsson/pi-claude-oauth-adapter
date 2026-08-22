@@ -54,17 +54,20 @@ Then inside Pi:
 
 ### From a local checkout
 
-If you use this repo directly, add the local package path to Pi settings:
+```bash
+git clone git@github.com:minzique/pi-claude-oauth-adapter.git
+pi install ./pi-claude-oauth-adapter
+```
+
+Or add the checkout path to Pi settings:
 
 ```json
 {
   "packages": [
-    "../../Developer/dotfiles-agents/packages/pi-claude-oauth-adapter"
+    "../../Developer/pi-claude-oauth-adapter"
   ]
 }
 ```
-
-`./setup.sh` in this repo already provisions that path when the active Pi settings symlink points at this checkout.
 
 ## Verify it is active
 
@@ -107,18 +110,21 @@ PI_CLAUDE_OAUTH_REINJECT_SCOPE=always pi
 
 See [CHANGELOG.md](./CHANGELOG.md).
 
-## Maintainer release flow
+## Development
 
 ```bash
-cd packages/pi-claude-oauth-adapter
+npm install
+npm run check
 npm pack --dry-run
-npm publish --access public
 ```
 
-Or from repo root:
+## Maintainer release flow
+
+From the repository root:
 
 ```bash
-npm publish ./packages/pi-claude-oauth-adapter --access public
+npm run check
+npm publish --access public
 ```
 
 ## Notes

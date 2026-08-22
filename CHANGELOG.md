@@ -2,6 +2,12 @@
 
 All notable changes to `pi-claude-oauth-adapter` live here.
 
+## 0.2.1 — 2026-08-22
+
+- Move the package into its own standalone repository.
+- Update npm metadata and local-development instructions for the new repository.
+- Add a real TypeScript check and the previously missing MIT license file.
+
 ## 0.2.0 — 2026-08-08
 
 - Sync the injected Claude billing header to Claude Code `2.1.226`, including conditional first-party `cch=00000` handling.
